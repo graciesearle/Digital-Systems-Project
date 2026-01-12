@@ -391,7 +391,7 @@ def run_evolution():
     best_genome = None
     best_fitness = -float('inf')
 
-    for gen in range(1, 51): # 50 Gens
+    for gen in range(1, 11): # 50 Gens
         for p in pop: p['fitness'] = calculate_fitness(p['genome'])
         pop.sort(key=lambda d: d['fitness'], reverse=True)
         
@@ -473,45 +473,93 @@ def get_next_filename(base_name="dance_pop", ext="gif"):
         counter += 1
 
 def save_video_with_music(genome, audio_path, beat_times, output_filename="dance_video.mp4"):
-    # 1. First, save the animation as a silent MP4
-    temp_filename = "temp_silent.mp4"
+    # Ensure filename ends in .mp4
+    if not output_filename.endswith(".mp4"):
+        output_filename = output_filename.replace(".gif", ".mp4")
     
+    print(f"Rendering MP4 to {output_filename}...")
+    
+    # 1. Setup the Plot
+    temp_filename = "temp_silent.mp4"
     fig = plt.figure(figsize=(6,6))
     ax = fig.add_subplot(111, projection='3d')
-    # ... (Your existing plotting setup) ...
+    bones = [("Hips", "Neck"), ("Neck", "Head"),
+             ("Neck", "L_Elbow"), ("L_Elbow", "L_Hand"),
+             ("Neck", "R_Elbow"), ("R_Elbow", "R_Hand"),
+             ("Hips", "L_Knee"), ("L_Knee", "L_Foot"),
+             ("Hips", "R_Knee"), ("R_Knee", "R_Foot")]
+
+    # 2. Calculate FPS
+    if len(beat_times) > 1:
+        duration = beat_times[-1] - beat_times[0]
+        calculated_fps = len(genome) / duration
+    else:
+        calculated_fps = 5 
     
-    # CALCULATE FPS based on beats
-    # Duration = Last Beat Time
-    duration = beat_times[-1] - beat_times[0]
-    # FPS = Total Frames / Duration
-    calculated_fps = len(genome) / duration
-    
-    print(f"Rendering at {calculated_fps:.2f} FPS to match audio...")
+    print(f"Video Duration: {duration:.2f}s | FPS: {calculated_fps:.2f}")
 
     def update(i):
-        # ... (Your existing update code) ...
-        # Add visual indicator for the beat
+        ax.clear()
+        ax.set_xlim(0, 1); ax.set_ylim(0, 1); ax.set_zlim(0, 1)
         ax.set_title(f"Beat {i+1}/{len(genome)}")
+        ax.view_init(elev=20, azim=i*2)
+        
+        # Floor
+        x, y = np.meshgrid(np.linspace(0, 1, 5), np.linspace(0, 1, 5))
+        ax.plot_surface(x, y, x*0, alpha=0.1, color='k')
 
+        # Draw AI (Red)
+        coords = calculate_pose_coords(genome[i])
+        for a, b in bones:
+            p1, p2 = coords[a], coords[b]
+            ax.plot([p1[0], p2[0]], [p1[1], p2[1]], [p1[2], p2[2]], 'r-', lw=3)
+        for k, v in coords.items():
+            ax.scatter(v[0], v[1], v[2], c='b')
+
+        # Draw Ghost (Green)
+        if REAL_DANCE_BANK:
+            min_d = float('inf')
+            match = None
+            sample = random.sample(REAL_DANCE_BANK, min(50, len(REAL_DANCE_BANK)))
+            check = ["L_Hand", "R_Hand", "L_Foot", "R_Foot"]
+            for ref in sample:
+                d = sum((coords[k][dim]-ref[k][dim])**2 for k in check for dim in range(3))
+                if d < min_d: min_d = d; match = ref
+            
+            if match:
+                for a, b in bones:
+                    p1, p2 = match[a], match[b]
+                    ax.plot([p1[0], p2[0]], [p1[1], p2[1]], [p1[2], p2[2]], 'g--', alpha=0.4)
+
+    # 3. Save Silent Video
     anim = FuncAnimation(fig, update, frames=len(genome))
-    # Save as MP4 using ffmpeg writer
     anim.save(temp_filename, writer='ffmpeg', fps=calculated_fps)
     plt.close()
 
-    # 2. Combine with Audio
+    # 4. Merge with Audio
     print("Merging audio...")
-    video_clip = VideoFileClip(temp_filename)
-    audio_clip = AudioFileClip(audio_path)
-    
-    # Trim audio to match video duration
-    final_audio = audio_clip.subclip(0, video_clip.duration)
-    
-    final_clip = video_clip.set_audio(final_audio)
-    final_clip.write_videofile(output_filename, codec='libx264')
+    try:
+        video_clip = VideoFileClip(temp_filename)
+        audio_clip = AudioFileClip(audio_path)
+        
+        # --- FIX: Use 'subclipped' instead of 'subclip' ---
+        final_audio = audio_clip.subclipped(0, video_clip.duration)
+        
+        final_clip = video_clip.with_audio(final_audio) # 'set_audio' is also deprecated in 2.0, use 'with_audio'
+        
+        final_clip.write_videofile(output_filename, codec='libx264', audio_codec='aac')
+        print(f"Success! Saved to {output_filename}")
+        
+    except Exception as e:
+        print(f"Error merging audio: {e}")
+        # Rename temp file so you at least have the silent video
+        if os.path.exists(temp_filename):
+            os.rename(temp_filename, output_filename.replace(".mp4", "_silent.mp4"))
+            print("Saved silent version instead.")
     
     # Cleanup
-    os.remove(temp_filename)
-    print(f"Saved music video to {output_filename}")
+    if os.path.exists(temp_filename):
+        os.remove(temp_filename)
 
 # --- RUN ---
 load_aist_data("AISTpop") # Ensure this folder exists
@@ -519,4 +567,4 @@ final = run_evolution()
 
 # Use auto-incrementing filename
 unique_filename = get_next_filename("dance_pop")
-save_3d_dance_gif(final, unique_filename)
+save_video_with_music(final, audio_path, beat_times, unique_filename)
