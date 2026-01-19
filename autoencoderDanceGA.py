@@ -7,7 +7,6 @@ Autoencoder-based Dance Generator with Genetic Algorithm Evaluation
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
-from mpl_toolkits.mplot3d import Axes3D
 import pickle
 import random
 import os
@@ -26,7 +25,7 @@ DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # Autoencoder Parameters
 SEQUENCE_LENGTH = 60  # 1 second of dance (60 frames at 60 FPS)
-LATENT_DIM = 64  # Dimension of latent space
+LATENT_DIM = 128  # Increased - need more capacity for 3060 output values
 HIDDEN_DIM = 512
 NUM_KEYPOINTS = 17
 NUM_COORDS = 3
@@ -34,14 +33,15 @@ INPUT_DIM = NUM_KEYPOINTS * NUM_COORDS  # 51 features per frame
 
 # Training Parameters
 BATCH_SIZE = 32
-LEARNING_RATE = 0.0001
+LEARNING_RATE = 0.001  # Higher LR works better with feedforward decoder
 NUM_EPOCHS = 100
+KL_WARMUP_EPOCHS = 20  # Epochs before KL reaches full weight
 
 # GA Parameters
 POPULATION_SIZE = 50
 NUM_GENERATIONS = 100
-MUTATION_RATE = 0.2
-MUTATION_STRENGTH = 0.3
+MUTATION_RATE = 0.15
+MUTATION_STRENGTH = 0.1  # Reduced - too high causes jerky/broken poses
 CROSSOVER_RATE = 0.7
 TOURNAMENT_SIZE = 5
 NUM_SEQUENCES = 4  # Number of latent sequences to evolve per genome
@@ -85,7 +85,7 @@ def load_pkl(filepath):
     return data.get('keypoints3d_optim', data.get('keypoints3d'))
 
 
-def load_all_sequences(data_folder, sequence_length=SEQUENCE_LENGTH, max_files=50):
+def load_all_sequences(data_folder, sequence_length=SEQUENCE_LENGTH, max_files=200):
     """Load dance data and split into fixed-length sequences
     
     Args:
@@ -190,66 +190,37 @@ class DanceEncoder(nn.Module):
 
 
 class DanceDecoder(nn.Module):
-    """Decodes a latent vector into a dance sequence"""
+    """Simple feedforward decoder - generates all frames at once (much easier to train)"""
     def __init__(self, latent_dim=LATENT_DIM, hidden_dim=HIDDEN_DIM, output_dim=INPUT_DIM):
         super().__init__()
         
-        self.hidden_dim = hidden_dim
         self.seq_len = SEQUENCE_LENGTH
+        self.output_dim = output_dim
         
-        # Project latent to initial hidden state
-        self.fc_init = nn.Linear(latent_dim, hidden_dim * 2)
-        
-        # LSTM to generate sequence
-        self.lstm = nn.LSTM(
-            input_size=output_dim,
-            hidden_size=hidden_dim,
-            num_layers=2,
-            batch_first=True,
-            dropout=0.2
+        # Simple MLP decoder
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, hidden_dim * 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim * 2, SEQUENCE_LENGTH * output_dim)  # Output all frames at once
         )
         
-        # Output projection
-        self.fc_out = nn.Linear(hidden_dim, output_dim)
-        
-        # Learnable start token
-        self.start_token = nn.Parameter(torch.randn(1, 1, output_dim))
-        
-    def forward(self, z, target=None, teacher_forcing_ratio=0.5, seq_len=SEQUENCE_LENGTH):
-        """Decode latent vector to sequence.
-        
-        Args:
-            z: Latent vector
-            target: Target sequence for teacher forcing (during training)
-            teacher_forcing_ratio: Probability of using target vs prediction
-            seq_len: Length of sequence to generate
-        """
+    def forward(self, z, target=None, teacher_forcing_ratio=0.0, seq_len=SEQUENCE_LENGTH):
+        """Decode latent vector to sequence (target and teacher_forcing_ratio ignored)"""
         batch_size = z.size(0)
         
-        # Initialize hidden state from latent
-        h_init = self.fc_init(z)
-        h0 = h_init[:, :self.hidden_dim].unsqueeze(0).repeat(2, 1, 1).contiguous()
-        c0 = h_init[:, self.hidden_dim:].unsqueeze(0).repeat(2, 1, 1).contiguous()
+        # Generate all frames at once
+        output = self.decoder(z)
         
-        # Start with learned token
-        outputs = []
-        current_input = self.start_token.expand(batch_size, -1, -1)
-        h, c = h0, c0
+        # Reshape to (batch, seq_len, output_dim)
+        output = output.view(batch_size, self.seq_len, self.output_dim)
         
-        use_teacher_forcing = target is not None and random.random() < teacher_forcing_ratio
-        
-        for t in range(seq_len):
-            out, (h, c) = self.lstm(current_input, (h, c))
-            frame = self.fc_out(out)
-            outputs.append(frame)
-            
-            # Teacher forcing: use real target as next input
-            if use_teacher_forcing and t < seq_len - 1:
-                current_input = target[:, t:t+1, :]
-            else:
-                current_input = frame
-        
-        return torch.cat(outputs, dim=1)
+        return output
 
 
 class DanceVAE(nn.Module):
@@ -309,8 +280,15 @@ def train_autoencoder(model, dataloader, num_epochs=NUM_EPOCHS):
         total_recon = 0
         total_kl = 0
         
-        # Decay teacher forcing over time (start high, end low)
-        teacher_forcing_ratio = max(0.2, 1.0 - epoch / num_epochs)
+        # Constant teacher forcing ratio (more stable than decay)
+        teacher_forcing_ratio = 0.5
+        
+        # KL annealing: gradually increase beta from 0 to 0.01
+        # This lets the model learn to reconstruct first, then organize latent space
+        if epoch < KL_WARMUP_EPOCHS:
+            beta = 0.01 * (epoch / KL_WARMUP_EPOCHS)
+        else:
+            beta = 0.01
         
         for batch in dataloader:
             batch = batch.to(DEVICE)
@@ -318,10 +296,11 @@ def train_autoencoder(model, dataloader, num_epochs=NUM_EPOCHS):
             optimizer.zero_grad()
             recon, mu, logvar = model(batch, teacher_forcing_ratio=teacher_forcing_ratio)
             
-            # Calculate losses (using beta=0.01)
-            recon_loss = nn.functional.mse_loss(recon, batch, reduction='sum')
-            kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-            loss = recon_loss + 0.01 * kl_loss
+            # Calculate losses with annealed beta
+            # Using 'mean' reduction for interpretable loss values
+            recon_loss = nn.functional.mse_loss(recon, batch, reduction='mean')
+            kl_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+            loss = recon_loss + beta * kl_loss
             
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -331,9 +310,11 @@ def train_autoencoder(model, dataloader, num_epochs=NUM_EPOCHS):
             total_recon += recon_loss.item()
             total_kl += kl_loss.item()
         
-        avg_loss = total_loss / len(dataloader.dataset)
-        avg_recon = total_recon / len(dataloader.dataset)
-        avg_kl = total_kl / len(dataloader.dataset)
+        # Average over batches (not dataset size since we use mean reduction)
+        num_batches = len(dataloader)
+        avg_loss = total_loss / num_batches
+        avg_recon = total_recon / num_batches
+        avg_kl = total_kl / num_batches
         
         history['loss'].append(avg_loss)
         history['recon_loss'].append(avg_recon)
@@ -392,8 +373,25 @@ def decode_genome(genome, model, dataset):
     combined = combined.reshape(-1, NUM_KEYPOINTS, NUM_COORDS)
     combined = combined * dataset.std.squeeze() + dataset.mean.squeeze()
     
+    # Apply temporal smoothing to reduce jerkiness
+    combined = smooth_frames(combined)
+    
     genome.decoded_frames = combined
     return combined
+
+
+def smooth_frames(frames, window_size=5):
+    """Apply moving average smoothing to reduce jerkiness"""
+    if len(frames) <= window_size:
+        return frames
+    
+    smoothed = np.copy(frames)
+    half_window = window_size // 2
+    
+    for i in range(half_window, len(frames) - half_window):
+        smoothed[i] = np.mean(frames[i - half_window:i + half_window + 1], axis=0)
+    
+    return smoothed
 
 
 def calculate_fitness(genome, model, dataset):
@@ -403,6 +401,8 @@ def calculate_fitness(genome, model, dataset):
     2. Movement variety
     3. Physical plausibility
     4. Transition smoothness between sequences
+    
+    Note: AIST++ data is typically in centimeters (values ~-75 to 220)
     """
     if genome.fitness is not None:
         return genome.fitness
@@ -416,20 +416,46 @@ def calculate_fitness(genome, model, dataset):
     score = 0
     
     # --- 1. Smoothness Score ---
+    # Per-frame displacement for each joint (cm per frame at 60fps)
     velocities = np.linalg.norm(np.diff(frames, axis=0), axis=(1, 2))
     mean_velocity = np.mean(velocities)
     velocity_std = np.std(velocities)
     
-    # Reward moderate movement
-    if 1.0 < mean_velocity < 10.0:
-        score += 100
-    elif mean_velocity < 0.5:
+    # AIST++ typical velocities are ~20-200 cm/frame summed across joints
+    # Reward moderate movement (scaled for cm units)
+    if 10 < mean_velocity < 150:
+        score += 100  # Good movement range
+    elif mean_velocity < 5:
         score -= 50  # Too static
-    elif mean_velocity > 20:
-        score -= 100  # Too jerky
+    elif mean_velocity > 300:
+        score -= 100  # Too jerky/unrealistic
     
-    # Penalize high variance (jerky)
-    score -= velocity_std * 5
+    # Penalize high variance (jerky) - scaled down
+    jerk_penalty = min(velocity_std * 0.5, 50)  # Cap penalty
+    score -= jerk_penalty
+    
+    # --- 1b. Per-Segment Smoothness (catch twitchy segments) ---
+    for seg_idx in range(NUM_SEQUENCES):
+        start = seg_idx * SEQUENCE_LENGTH
+        end = start + SEQUENCE_LENGTH
+        if end <= len(frames):
+            seg_velocities = velocities[start:end-1] if end-1 <= len(velocities) else velocities[start:]
+            if len(seg_velocities) > 0:
+                seg_std = np.std(seg_velocities)
+                if seg_std > 30:  # This segment is twitchy
+                    score -= (seg_std - 30) * 1.5
+    
+    # --- 1c. Acceleration Smoothness (penalize sudden velocity changes) ---
+    if len(velocities) > 1:
+        accelerations = np.abs(np.diff(velocities))
+        mean_accel = np.mean(accelerations)
+        max_accel = np.max(accelerations)
+        # Penalize high average acceleration (jerky overall)
+        if mean_accel > 20:
+            score -= (mean_accel - 20) * 2
+        # Penalize extreme single-frame jerks
+        if max_accel > 80:
+            score -= (max_accel - 80) * 0.5
     
     # --- 2. Transition Smoothness ---
     # Check velocity at sequence boundaries
@@ -437,39 +463,82 @@ def calculate_fitness(genome, model, dataset):
         boundary = i * SEQUENCE_LENGTH
         if boundary < len(frames) - 1:
             transition_vel = np.linalg.norm(frames[boundary] - frames[boundary - 1])
-            if transition_vel > 15:
-                score -= 30  # Bad transition
-            elif transition_vel < 5:
+            # Scaled for cm units (typical single-frame displacement ~5-30cm)
+            if transition_vel > 100:
+                score -= 30  # Bad transition (jump)
+            elif transition_vel < 50:
                 score += 20  # Smooth transition
     
     # --- 3. Physical Plausibility ---
-    # Feet should stay relatively low (ankles are indices 15, 16)
-    ankle_heights = frames[:, [15, 16], 1]  # Y is height
+    # In AIST++, Y-axis is typically height (after axis swap)
+    # Feet/ankles are indices 15, 16
+    ankle_heights = frames[:, [15, 16], 1]  # Y coordinate
     min_ankle = np.min(ankle_heights)
-    max_ankle = np.max(ankle_heights)
     
-    # Penalize if ankles go too high or negative
-    if min_ankle < 0:
-        score -= abs(min_ankle) * 50
+    # Ankles shouldn't go below a reasonable floor level
+    # (floor is roughly at y=0 in normalized AIST++)
+    if min_ankle < -50:  # Way below floor
+        score -= min(abs(min_ankle + 50) * 0.5, 50)  # Cap penalty
     
     # --- 4. Head Above Hips ---
     head_y = frames[:, 0, 1]  # Nose Y
     hip_y = np.mean(frames[:, [11, 12], 1], axis=1)  # Average hip Y
     
     upright_ratio = np.mean(head_y > hip_y)
-    score += upright_ratio * 80
+    score += upright_ratio * 100  # Strong reward for being upright
     
     # --- 5. Movement Variety ---
-    # Reward diverse movements (different poses)
+    # Reward diverse movements (different poses over time)
     pose_variance = np.var(frames, axis=0).mean()
-    score += min(pose_variance * 2, 50)  # Cap bonus
+    # Scale for cm² units - typical variance ~100-1000
+    variety_score = min(pose_variance * 0.1, 50)  # Cap bonus at 50
+    score += variety_score
     
     # --- 6. Latent Space Regularization ---
-    # Penalize extreme latent values
+    # Penalize extreme latent values (keep near training distribution)
     for latent in genome.latent_vectors:
         latent_norm = np.linalg.norm(latent)
-        if latent_norm > 5:
-            score -= (latent_norm - 5) * 10
+        # Typical latent norms from encoder should be ~sqrt(128) ≈ 11
+        if latent_norm > 15:
+            score -= (latent_norm - 15) * 5
+    
+    # --- 7. Bone Length Consistency ---
+    # Check that limb lengths don't vary too wildly (anatomically plausible)
+    bone_length_penalty = 0
+    for bone in [(5, 7), (7, 9), (6, 8), (8, 10), (11, 13), (13, 15), (12, 14), (14, 16)]:
+        bone_lengths = np.linalg.norm(frames[:, bone[0]] - frames[:, bone[1]], axis=1)
+        bone_std = np.std(bone_lengths)
+        if bone_std > 10:  # Bone length varying more than 10cm is unrealistic
+            bone_length_penalty += (bone_std - 10) * 2
+    score -= min(bone_length_penalty, 50)  # Cap penalty
+    
+    # --- 8. Head Connectivity (prevent broken head) ---
+    # Head (nose=0) should maintain reasonable distance from shoulders (5, 6)
+    # and ears (1, 2) should stay near nose
+    nose = frames[:, 0]  # (N, 3)
+    left_shoulder = frames[:, 5]
+    right_shoulder = frames[:, 6]
+    left_ear = frames[:, 1]
+    right_ear = frames[:, 2]
+    
+    # Nose-to-shoulder distance (should be ~20-40cm typically)
+    neck_dist_left = np.linalg.norm(nose - left_shoulder, axis=1)
+    neck_dist_right = np.linalg.norm(nose - right_shoulder, axis=1)
+    avg_neck_dist = (neck_dist_left + neck_dist_right) / 2
+    
+    # Penalize if head too far or too close to shoulders
+    for dist in avg_neck_dist:
+        if dist > 60:  # Head way too far from body
+            score -= (dist - 60) * 2
+        elif dist < 10:  # Head inside body
+            score -= (10 - dist) * 5
+    
+    # Ears should stay near nose (within ~15cm)
+    ear_dist_left = np.linalg.norm(nose - left_ear, axis=1)
+    ear_dist_right = np.linalg.norm(nose - right_ear, axis=1)
+    for dist in np.concatenate([ear_dist_left, ear_dist_right]):
+        if dist > 25:  # Ear flying away from head
+            score -= (dist - 25) * 3
     
     genome.fitness = score
     return score
@@ -495,16 +564,22 @@ def crossover(parent1, parent2):
     return LatentGenome(child_vectors)
 
 
-def mutate(genome):
-    """Mutate latent vectors with Gaussian noise"""
+def mutate(genome, real_latents=None):
+    """Mutate by interpolating toward known-good latent vectors (safer than noise)"""
     mutated_vectors = []
     
     for latent in genome.latent_vectors:
         if random.random() < MUTATION_RATE:
-            # Add Gaussian noise
-            noise = np.random.randn(LATENT_DIM).astype(np.float32) * MUTATION_STRENGTH
-            mutated = latent + noise
-            mutated_vectors.append(mutated)
+            if real_latents is not None and len(real_latents) > 0:
+                # Interpolate toward a real dance latent (stays in learned distribution)
+                target = random.choice(real_latents)
+                alpha = random.uniform(0.7, 0.95)  # Mostly keep original, blend a little
+                mutated = alpha * latent + (1 - alpha) * target
+                mutated_vectors.append(mutated.astype(np.float32))
+            else:
+                # Fallback: very small noise
+                noise = np.random.randn(LATENT_DIM).astype(np.float32) * 0.05
+                mutated_vectors.append(latent + noise)
         else:
             mutated_vectors.append(latent.copy())
     
@@ -530,12 +605,43 @@ def interpolate_latent(genome):
     return LatentGenome(mutated_vectors)
 
 
+def get_real_dance_latents(model, dataset, num_samples=10):
+    """Encode real dances to get latent vectors from the learned distribution"""
+    model.eval()
+    latents = []
+    
+    # Sample random sequences from the dataset
+    indices = random.sample(range(len(dataset)), min(num_samples * NUM_SEQUENCES, len(dataset)))
+    
+    with torch.no_grad():
+        for idx in indices:
+            seq = dataset.data[idx].unsqueeze(0).to(DEVICE)
+            mu = model.encode(seq)
+            latents.append(mu.cpu().numpy()[0])
+    
+    return latents
+
+
 def run_ga_evolution(model, dataset):
     """Run genetic algorithm to find novel dances"""
     print(f"\nInitializing GA population of {POPULATION_SIZE}...")
     
-    # Initialize population
-    population = [LatentGenome() for _ in range(POPULATION_SIZE)]
+    # Get latent vectors from real dances to seed population
+    print("Encoding real dances to seed population...")
+    real_latents = get_real_dance_latents(model, dataset, num_samples=POPULATION_SIZE)
+    
+    # Initialize population: 100% from real dances (safest approach)
+    population = []
+    
+    # Seed all with real dance latents (with tiny perturbations for variety)
+    for i in range(POPULATION_SIZE):
+        latent_vectors = []
+        for j in range(NUM_SEQUENCES):
+            idx = (i * NUM_SEQUENCES + j) % len(real_latents)
+            # Very small noise just for diversity
+            noisy_latent = real_latents[idx] + np.random.randn(LATENT_DIM).astype(np.float32) * 0.02
+            latent_vectors.append(noisy_latent)
+        population.append(LatentGenome(latent_vectors))
     
     # Evaluate initial fitness
     for genome in population:
@@ -558,10 +664,10 @@ def run_ga_evolution(model, dataset):
             parent2 = tournament_select(population)
             
             child = crossover(parent1, parent2)
-            child = mutate(child)
+            child = mutate(child, real_latents)
             
             # Occasionally do interpolation mutation
-            if random.random() < 0.1:
+            if random.random() < 0.2:
                 child = interpolate_latent(child)
             
             calculate_fitness(child, model, dataset)
@@ -738,7 +844,7 @@ def main():
     model = DanceVAE()
     
     # Check for saved model
-    model_path = 'dance_vae_model.pth'
+    model_path = 'best_dance_vae_model.pth'
     if os.path.exists(model_path):
         print(f"\nLoading pre-trained model from {model_path}")
         model.load_state_dict(torch.load(model_path, map_location=DEVICE))
