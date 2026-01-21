@@ -139,7 +139,7 @@ def run_evolution():
     return best_dance['genome']
 
 # -----------------------------------------------------------------
-# --- VISUALIZATION FUNCTION (for .py scripts) ---
+# --- VISUALISATION FUNCTION ---
 # -----------------------------------------------------------------
 
 def draw_pose_on_axis(ax, pose_coords):

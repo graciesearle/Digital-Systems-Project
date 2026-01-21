@@ -2,11 +2,10 @@
 Music-Conditioned Autoencoder Dance Generator with Genetic Algorithm
 Extends autoencoderDanceGA.py to generate dances conditioned on music input.
 
-Key additions:
 1. Audio feature extraction using librosa (mel spectrograms, beats, tempo)
 2. AudioEncoder to process music features
 3. Conditional decoder that takes both latent vector and audio features
-4. Music-dance synchronization in fitness function
+4. Music-dance synchronisation in fitness function
 5. Paired music-dance dataset loading
 """
 
@@ -22,6 +21,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
+import librosa
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -133,7 +133,7 @@ def load_audio_features(audio_path, duration=None):
     )
     mel_spec_db = librosa.power_to_db(mel_spec, ref=np.max)
     
-    # Normalize mel spectrogram
+    # Normalise mel spectrogram
     mel_spec_db = (mel_spec_db - mel_spec_db.mean()) / (mel_spec_db.std() + 1e-8)
     
     # Beat tracking
@@ -345,16 +345,16 @@ class MusicDanceDataset(Dataset):
     """PyTorch Dataset for paired music-dance sequences"""
     
     def __init__(self, dance_sequences, audio_sequences=None):
-        # Normalize dance data
+        # Normalise dance data
         self.dance_mean = dance_sequences.mean(axis=(0, 1), keepdims=True)
         self.dance_std = dance_sequences.std(axis=(0, 1), keepdims=True) + 1e-8
         
-        # Normalize and flatten dance: (N, seq_len, 17, 3) -> (N, seq_len, 51)
-        normalized_dance = (dance_sequences - self.dance_mean) / self.dance_std
-        self.dance_data = normalized_dance.reshape(len(dance_sequences), SEQUENCE_LENGTH, -1)
+        # Normalise and flatten dance: (N, seq_len, 17, 3) -> (N, seq_len, 51)
+        normalised_dance = (dance_sequences - self.dance_mean) / self.dance_std
+        self.dance_data = normalised_dance.reshape(len(dance_sequences), SEQUENCE_LENGTH, -1)
         self.dance_data = torch.FloatTensor(self.dance_data)
         
-        # Audio data (already normalized during extraction)
+        # Audio data (already normalised during extraction)
         self.has_audio = audio_sequences is not None
         if self.has_audio:
             self.audio_data = torch.FloatTensor(audio_sequences)  # (N, n_mels+2, seq_len)
@@ -368,8 +368,8 @@ class MusicDanceDataset(Dataset):
     def __getitem__(self, idx):
         return self.dance_data[idx], self.audio_data[idx]
     
-    def denormalize_dance(self, data):
-        """Convert normalized dance data back to original scale"""
+    def denormalise_dance(self, data):
+        """Convert normalised dance data back to original scale"""
         if isinstance(data, torch.Tensor):
             data = data.cpu().numpy()
         
@@ -564,7 +564,7 @@ class MusicConditionedVAE(nn.Module):
         self.dance_encoder = DanceEncoder()
         self.decoder = ConditionalDanceDecoder()
         
-    def reparameterize(self, mu, logvar):
+    def reparameterise(self, mu, logvar):
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
         return mu + eps * std
@@ -572,7 +572,7 @@ class MusicConditionedVAE(nn.Module):
     def forward(self, dance, audio):
         """
         Args:
-            dance: (batch, seq_len, 51) normalized dance sequence
+            dance: (batch, seq_len, 51) normalised dance sequence
             audio: (batch, n_mels+2, seq_len) audio features
         """
         # Encode audio
@@ -580,7 +580,7 @@ class MusicConditionedVAE(nn.Module):
         
         # Encode dance
         mu, logvar = self.dance_encoder(dance)
-        z = self.reparameterize(mu, logvar)
+        z = self.reparameterise(mu, logvar)
         
         # Decode with audio conditioning
         reconstruction = self.decoder(z, audio_embed, audio_global)
@@ -617,8 +617,8 @@ def train_music_vae(model, dataloader, num_epochs=NUM_EPOCHS):
     """Train the music-conditioned VAE"""
     print(f"\nTraining Music-Conditioned VAE on {DEVICE}...")
     model = model.to(DEVICE)
-    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=5, factor=0.5)
+    optimiser = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimiser, patience=5, factor=0.5)
     
     history = {'loss': [], 'recon_loss': [], 'kl_loss': []}
     
@@ -638,7 +638,7 @@ def train_music_vae(model, dataloader, num_epochs=NUM_EPOCHS):
             dance_batch = dance_batch.to(DEVICE)
             audio_batch = audio_batch.to(DEVICE)
             
-            optimizer.zero_grad()
+            optimiser.zero_grad()
             recon, mu, logvar = model(dance_batch, audio_batch)
             
             # Losses
@@ -648,7 +648,7 @@ def train_music_vae(model, dataloader, num_epochs=NUM_EPOCHS):
             
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
+            optimiser.step()
             
             total_loss += loss.item()
             total_recon += recon_loss.item()
@@ -692,6 +692,68 @@ class MusicConditionedGenome:
         self.audio_features = audio_features  # Audio to condition on
         self.fitness = None
         self.decoded_frames = None
+
+
+# Global cache for reference poses (populated once)
+_reference_poses_cache = None
+
+def get_reference_poses(dataset, num_samples=500):
+    """
+    Get a set of reference poses from the training data for novelty computation.
+    Caches results to avoid recomputation.
+    """
+    global _reference_poses_cache
+    
+    if _reference_poses_cache is not None:
+        return _reference_poses_cache
+    
+    # Sample poses from the dataset
+    indices = np.random.choice(len(dataset), min(num_samples, len(dataset)), replace=False)
+    reference_poses = []
+    
+    for idx in indices:
+        dance, _ = dataset[idx]
+        # Denormalise and reshape
+        dance_np = dance.numpy().reshape(SEQUENCE_LENGTH, NUM_KEYPOINTS, NUM_COORDS)
+        dance_np = dance_np * dataset.dance_std.squeeze() + dataset.dance_mean.squeeze()
+        # Sample a few frames from each sequence
+        for frame_idx in range(0, SEQUENCE_LENGTH, 10):  # Every 10th frame
+            reference_poses.append(dance_np[frame_idx])
+    
+    _reference_poses_cache = np.array(reference_poses)  # (N, 17, 3)
+    print(f"Cached {len(_reference_poses_cache)} reference poses for novelty computation")
+    return _reference_poses_cache
+
+
+def compute_pose_novelty(frames, reference_poses):
+    """
+    Compute novelty score for generated frames.
+    Novelty = average minimum distance to reference poses.
+    Higher distance = more novel.
+    
+    Returns a normalised novelty score (0-1 range, higher = more novel)
+    """
+    if reference_poses is None or len(reference_poses) == 0:
+        return 0.5  # Neutral if no reference
+    
+    # Sample frames to reduce computation
+    sample_indices = np.linspace(0, len(frames) - 1, min(20, len(frames))).astype(int)
+    sampled_frames = frames[sample_indices]  # (20, 17, 3)
+    
+    min_distances = []
+    for frame in sampled_frames:
+        # Compute distance to all reference poses
+        distances = np.linalg.norm(reference_poses - frame, axis=(1, 2))  # (N,)
+        min_dist = np.min(distances)
+        min_distances.append(min_dist)
+    
+    avg_min_distance = np.mean(min_distances)
+    
+    # Normalise: typical distance range is ~50-300 for AIST++ data
+    # Map to 0-1 range with sigmoid-like scaling
+    novelty_score = 1 - np.exp(-avg_min_distance / 100)
+    
+    return novelty_score
 
 
 def decode_music_genome(genome, model, dataset):
@@ -767,12 +829,18 @@ def smooth_frames(frames, window_size=5):
 
 def calculate_music_sync_fitness(genome, model, dataset):
     """
-    Calculate fitness with music synchronization metrics.
+    Calculate fitness with music synchronisation metrics.
     
-    Adds to standard fitness:
+    Balances 80% accuracy (motion quality + music sync) with 20% novelty.
+    
+    Accuracy metrics:
     - Beat alignment: Movement peaks should align with musical beats
     - Tempo matching: Dance speed should match music tempo
     - Onset responsiveness: Movements should respond to musical onsets
+    - Physical plausibility and smoothness
+    
+    Novelty metric:
+    - Distance from training data poses (rewards unseen moves)
     """
     if genome.fitness is not None:
         return genome.fitness
@@ -824,7 +892,7 @@ def calculate_music_sync_fitness(genome, model, dataset):
     pose_variance = np.var(frames, axis=0).mean()
     score += min(pose_variance * 0.1, 50)
     
-    # === Music Synchronization Metrics ===
+    # === Music Synchronisation Metrics ===
     
     if genome.audio_features is not None and len(genome.audio_features) > 0:
         try:
@@ -858,14 +926,32 @@ def calculate_music_sync_fitness(genome, model, dataset):
         except Exception as e:
             pass  # Skip music metrics if there's an issue
     
-    # Latent space regularization
+    # Latent space regularisation
     for latent in genome.latent_vectors:
         latent_norm = np.linalg.norm(latent)
         if latent_norm > 15:
             score -= (latent_norm - 15) * 5
     
-    genome.fitness = score
-    return score
+    # === Novelty Reward (20% of total fitness) ===
+    # Get reference poses for novelty computation
+    reference_poses = get_reference_poses(dataset)
+    novelty_score = compute_pose_novelty(frames, reference_poses)
+    
+    # Scale: accuracy metrics above typically sum to ~100-250
+    # For 80/20 balance, novelty should contribute ~25-60 points when novel
+    # novelty_score is 0-1, so multiply by max novelty reward
+    MAX_NOVELTY_REWARD = 75  # ~20% of typical max accuracy score (~300)
+    novelty_reward = novelty_score * MAX_NOVELTY_REWARD
+    
+    # Apply 80/20 weighting
+    # accuracy_weight = 0.8, novelty_weight = 0.2 (already baked into MAX_NOVELTY_REWARD)
+    accuracy_score = score  # This is the 80% (motion quality + music sync)
+    
+    # Final score combines both
+    final_score = accuracy_score + novelty_reward
+    
+    genome.fitness = final_score
+    return final_score
 
 
 def tournament_select(population):
@@ -936,12 +1022,12 @@ def run_music_ga_evolution(model, dataset, target_music_features=None):
         target_music_features: Audio features to generate dance for
                               Shape: list of (n_mels+2, seq_len) arrays
     """
-    print(f"\nInitializing Music-Conditioned GA (population: {POPULATION_SIZE})...")
+    print(f"\nInitialising Music-Conditioned GA (population: {POPULATION_SIZE})...")
     
     # Get real latent vectors for seeding
     real_latents = get_real_dance_latents(model, dataset, num_samples=POPULATION_SIZE)
     
-    # Initialize population
+    # Initialise population
     population = []
     for i in range(POPULATION_SIZE):
         latent_vectors = []
@@ -996,7 +1082,7 @@ def run_music_ga_evolution(model, dataset, target_music_features=None):
 
 
 # =============================================================================
-# --- VISUALIZATION ---
+# --- VISUALISATION ---
 # =============================================================================
 
 def get_bone_color(bone_idx):
@@ -1014,9 +1100,9 @@ def get_bone_color(bone_idx):
         return BONE_COLORS['left_leg']
 
 
-def visualize_dance_with_music(frames, audio_path=None, title="Generated Dance"):
-    """Visualize dance, optionally with synchronized music playback"""
-    print(f"\nPreparing visualization ({len(frames)} frames)...")
+def visualise_dance_with_music(frames, audio_path=None, title="Generated Dance"):
+    """Visualise dance, optionally with synchronised music playback"""
+    print(f"\nPreparing visualisation ({len(frames)} frames)...")
     
     x_min, x_max = frames[:,:,0].min(), frames[:,:,0].max()
     y_min, y_max = frames[:,:,2].min(), frames[:,:,2].max()
@@ -1303,8 +1389,8 @@ def main():
     # Decode the best dance
     frames = decode_music_genome(best_genome, model, dataset)
     
-    # Visualize
-    visualize_dance_with_music(frames, str(music_track), 
+    # Visualise
+    visualise_dance_with_music(frames, str(music_track), 
                                f"Dance for {music_track.stem}")
     
     # Ask to save
