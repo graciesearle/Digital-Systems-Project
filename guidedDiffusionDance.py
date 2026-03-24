@@ -112,6 +112,9 @@ DIFF_LR = 1e-4
 TARGET_REALISM = 1
 GUIDANCE_SCALE = 3.0
 DDIM_STEPS = 200
+MIN_FINAL_CRITIC_SCORE = 0.88      # Retry a segment if final score falls below this
+SEGMENT_MAX_ATTEMPTS = 3           # Max guided sampling retries per segment
+TARGET_SCORE_TOLERANCE = 0.03      # Accept segment when |score - target| is below this
 
 # --- Output ---
 NUM_SEGMENTS = 4  # how many 1-second segments to generate for one dance
@@ -504,12 +507,16 @@ class AdversarialCritic(nn.Module):
 
 def train_critic(critic, vae, dataloader, epochs=CRITIC_EPOCHS, lr=CRITIC_LR):
     """
-    Train the Critic with multiple difficulty tiers of fake data:
-      Real:   clean AIST++ sequences (label=1)
-      Fake 1: VAE-decoded random latent vectors (label=0)  — easy negatives
-      Fake 2: VAE encode→decode (reconstructions) + noise  — hard negatives
-      Fake 3: Real sequences with shuffled frames           — temporal negatives
-    Using label smoothing (0.9/0.1) to prevent overconfident sigmoid saturation.
+        Train the Critic with hard-negative mining so fake data stays challenging.
+
+        Strategy
+        --------
+        1) Build a large pool of heterogeneous fakes per batch (easy + near-real).
+        2) Score the pool with the current critic.
+        3) Keep only the hardest negatives (highest "real" scores).
+        4) Train on clean real data versus mined hard fakes.
+
+        This prevents the critic from saturating on trivially fake samples.
     """
     print(f"\n{'='*55}")
     print(f"  [Step 3] Training Adversarial Critic  ({epochs} epochs)")
@@ -523,43 +530,76 @@ def train_critic(critic, vae, dataloader, epochs=CRITIC_EPOCHS, lr=CRITIC_LR):
 
     for epoch in range(epochs):
         critic.train()
-        tot_loss = correct = total = 0
+        tot_loss = 0.0
+        correct = 0
+        total = 0
+
+        # Curriculum: start moderate, then increase fake difficulty.
+        hardness = min(1.0, (epoch + 1) / max(int(epochs * 0.4), 1))
 
         for dance_b, _ in dataloader:
             B = dance_b.size(0)
             dance_b = dance_b.to(DEVICE)
 
+            # Mild augmentation keeps the critic from keying on tiny artefacts.
+            real_in = dance_b + 0.01 * torch.randn_like(dance_b)
+
             # --- Real (label-smoothed: 0.9 instead of 1.0) ---
             real_labels = torch.full((B, 1), 0.9, device=DEVICE)
-            pred_real = critic(dance_b)
+            pred_real = critic(real_in)
             loss_real = F.binary_cross_entropy(pred_real, real_labels)
 
-            # --- Fake tier 1: random latent → decoder (easy negatives) ---
-            with torch.no_grad():
-                z_random = torch.randn(B // 3 + 1, LATENT_DIM, device=DEVICE)
-                fake_random = vae.decode(z_random)
-
-            # --- Fake tier 2: encode real → decode + Gaussian noise (hard negatives) ---
+            # --- Candidate fake pool ---
             with torch.no_grad():
                 z_real = vae.encode(dance_b)
-                noise_scale = 0.3 + 0.7 * random.random()  # vary difficulty
-                z_perturbed = z_real + noise_scale * torch.randn_like(z_real)
-                fake_perturbed = vae.decode(z_perturbed)
 
-            # --- Fake tier 3: temporally shuffled real sequences ---
-            with torch.no_grad():
-                perm = torch.randperm(dance_b.size(1))
-                fake_shuffled = dance_b[:, perm, :]
+                # Easy negatives: random latent samples.
+                z_random = torch.randn(B, LATENT_DIM, device=DEVICE)
+                fake_random = vae.decode(z_random)
 
-            # Combine all fakes
-            all_fakes = torch.cat([
-                fake_random[:B // 3],
-                fake_perturbed[:B // 3],
-                fake_shuffled[:B - 2 * (B // 3)],
-            ], dim=0)
+                # Near-real negatives: small and large latent perturbations.
+                low_noise = 0.05 + 0.15 * hardness
+                high_noise = 0.25 + 0.45 * hardness
+                z_perturbed_low = z_real + low_noise * torch.randn_like(z_real)
+                z_perturbed_high = z_real + high_noise * torch.randn_like(z_real)
+                fake_perturbed_low = vae.decode(z_perturbed_low)
+                fake_perturbed_high = vae.decode(z_perturbed_high)
 
-            fake_labels = torch.full((all_fakes.size(0), 1), 0.1, device=DEVICE)
-            pred_fake = critic(all_fakes.detach())
+                # Reconstructions are usually close to real and therefore hard.
+                fake_recon = vae.decode(z_real)
+
+                # Temporal negatives: local continuity broken by roll + swap.
+                shift = random.randint(1, max(2, dance_b.size(1) // 6))
+                fake_rolled = torch.roll(dance_b, shifts=shift, dims=1)
+                split = random.randint(dance_b.size(1) // 4, 3 * dance_b.size(1) // 4)
+                fake_swapped = torch.cat([dance_b[:, split:, :], dance_b[:, :split, :]], dim=1)
+
+                # Structural negatives: random feature dropout across all frames.
+                drop_prob = 0.05 + 0.20 * hardness
+                feat_keep = (torch.rand(B, 1, INPUT_DIM, device=DEVICE) > drop_prob).float()
+                fake_dropout = dance_b * feat_keep
+
+                candidate_fakes = torch.cat([
+                    fake_random,
+                    fake_recon,
+                    fake_perturbed_low,
+                    fake_perturbed_high,
+                    fake_rolled,
+                    fake_swapped,
+                    fake_dropout,
+                ], dim=0)
+
+                # Mine hardest negatives: choose fakes critic still thinks are real.
+                cand_scores = critic(candidate_fakes).squeeze(1)
+                hard_k = min(B, candidate_fakes.size(0))
+                hard_idx = torch.topk(cand_scores, k=hard_k, largest=True).indices
+                hard_fakes = candidate_fakes[hard_idx]
+
+            # Add noise so the critic focuses on structure/motion, not pixel-perfect cues.
+            hard_fakes = hard_fakes + 0.01 * torch.randn_like(hard_fakes)
+
+            fake_labels = torch.full((hard_fakes.size(0), 1), 0.1, device=DEVICE)
+            pred_fake = critic(hard_fakes.detach())
             loss_fake = F.binary_cross_entropy(pred_fake, fake_labels)
 
             loss = (loss_real + loss_fake) / 2.0
@@ -569,13 +609,13 @@ def train_critic(critic, vae, dataloader, epochs=CRITIC_EPOCHS, lr=CRITIC_LR):
             nn.utils.clip_grad_norm_(critic.parameters(), 1.0)
             opt.step()
 
-            tot_loss += loss.item() * B
+            tot_loss += loss.item()
             correct += ((pred_real > 0.5).sum() + (pred_fake < 0.5).sum()).item()
-            total += B + all_fakes.size(0)
+            total += B + hard_fakes.size(0)
 
         sched.step()
         acc = correct / max(total, 1)
-        history["loss"].append(tot_loss / max(total // 2, 1))
+        history["loss"].append(tot_loss / max(len(dataloader), 1))
         history["acc"].append(acc)
 
         if (epoch + 1) % 10 == 0:
@@ -842,7 +882,8 @@ def train_diffusion(denoiser, latent_dataset, schedule,
 
 def guided_sample(denoiser, vae, critic, schedule, audio=None,
                   num_samples=1, steps=DDIM_STEPS,
-                  target=TARGET_REALISM, guidance_scale=GUIDANCE_SCALE):
+                  target=TARGET_REALISM, guidance_scale=GUIDANCE_SCALE,
+                  return_score=False):
     """
     Classifier-guided DDIM sampling in the VAE's latent space.
     Returns decoded dance sequences (num_samples, T, 51) on CPU.
@@ -851,17 +892,30 @@ def guided_sample(denoiser, vae, critic, schedule, audio=None,
     print(f"    target={target:.0%}  base scale={guidance_scale}  steps={steps}")
     target = float(target)
 
-    # High targets (>=85%) get progressively safer hyper-parameters so 100% runs do not collapse.
+    # High targets (>=85%) get progressively safer hyper-parameters so extreme pushes stay stable.
     high_push = max(target - 0.85, 0.0) / 0.15  # 0 at 85%, 1 at 100%
     scale_factor = 1.0 - 0.4 * high_push        # trim up to 40% of the user scale near 100%
     safe_scale = max(0.1, guidance_scale * scale_factor)
     freeze_margin = max(0.02, 0.08 - 0.06 * high_push)  # freeze a tad before target when pushing hard
 
+    # Realistic cap: critic probabilities rarely reach 1.0, so hard 100% targets can
+    # keep pushing until late steps and destabilise.
+    effective_target = min(target, 0.93)
+
     print(f"    target-adapted scale={safe_scale:.2f}  freeze margin={freeze_margin:.3f}")
+    if effective_target < target:
+        print(f"    effective target capped to {effective_target:.0%} for stability")
     denoiser.eval()
     vae.eval()
     # Critic MUST stay in train mode — cuDNN RNN does not support backward in eval mode
     critic.train()
+
+    # Reduce critic stochasticity during guidance.
+    old_temporal_dropout = getattr(critic.temporal, "dropout", 0.0)
+    critic.temporal.dropout = 0.0
+    head_dropouts = [m for m in critic.head.modules() if isinstance(m, nn.Dropout)]
+    for m in head_dropouts:
+        m.eval()
 
     T = schedule.T
     times = torch.linspace(T - 1, 0, steps, dtype=torch.long, device=DEVICE)
@@ -877,9 +931,10 @@ def guided_sample(denoiser, vae, critic, schedule, audio=None,
     # Only start guiding after 30% of steps (early z0 predictions bad)
     guide_start = int(steps * 0.3)
 
-    # Best-z tracking: keep the latent that scored highest
+    # Best-z tracking: keep the latent whose critic score is closest to target.
     best_z = z.clone()
     best_score = 0.0
+    best_dist = float("inf")
     guidance_frozen = False  # stop guiding once target reached
 
     for i, t_val in enumerate(times):
@@ -899,31 +954,37 @@ def guided_sample(denoiser, vae, critic, schedule, audio=None,
                 decoded = vae.decode(z0_g)          # (B, T, 51)
                 score = critic(decoded)              # (B, 1)
 
-                # Log-score maximization: ∇log(score) = 1/score — never vanishes
-                # This is the standard classifier guidance formulation
-                log_score = torch.log(score.clamp(min=1e-6))
-                log_score.sum().backward()
+                # Explicit target matching objective: minimize (score - target)^2.
+                target_loss = torch.mean((score - effective_target) ** 2)
+                target_loss.backward()
             grad = z0_g.grad.detach()
 
             # Normalise gradient direction
             grad_norm = grad.norm(dim=-1, keepdim=True).clamp(min=1e-8)
             grad = grad / grad_norm
+            mean_score = score.mean().item()
 
             # Gentle ramp up over the first 40% of guided steps, then hold
             progress = (i - guide_start) / max(steps - guide_start - 1, 1)
             ramp = min(progress / 0.4, 1.0)
             adaptive_scale = safe_scale * ramp
 
-            z0_pred = z0_pred + adaptive_scale * grad  # ADD to increase score
+            # Taper guidance near the target to avoid oscillation/overshoot.
+            dist_to_target = abs(mean_score - effective_target)
+            taper = max(0.15, min(1.0, dist_to_target / max(2 * freeze_margin, 1e-6)))
+            adaptive_scale *= taper
 
-            # Track best z0 for fallback
-            mean_score = score.mean().item()
-            if mean_score > best_score:
+            # Gradient descent on target loss moves score toward target from either side.
+            z0_pred = z0_pred - adaptive_scale * grad
+
+            # Track best z0 for fallback (closest to target).
+            if dist_to_target < best_dist:
+                best_dist = dist_to_target
                 best_score = mean_score
                 best_z = z0_pred.detach().clone()
 
-            # Freeze guidance once we exceed target — let DDIM finish cleanly
-            if mean_score >= target - freeze_margin:
+            # Freeze guidance when we are already close enough to target.
+            if dist_to_target <= freeze_margin:
                 guidance_frozen = True
 
         # 3. DDIM update
@@ -939,17 +1000,30 @@ def guided_sample(denoiser, vae, critic, schedule, audio=None,
                 s = critic(vae.decode(z0_pred)).mean().item()
             print(f"      step {i+1}/{steps}  critic={s:.3f}")
 
-    # Final decode — use best_z fallback if final result collapsed
+    # Final decode — fall back to best-target snapshot if final drifted away.
     with torch.no_grad():
         final_dance = vae.decode(z)          # (B, T, 51)
         final_score = critic(final_dance).mean().item()
-        if final_score < target - freeze_margin and best_score >= target - freeze_margin:
-            print(f"    Final score {final_score:.3f} collapsed — using best snapshot ({best_score:.3f})")
+        final_dist = abs(final_score - effective_target)
+        drift_margin = 0.01
+        if final_dist > best_dist + drift_margin:
+            print(
+                f"    Final score {final_score:.3f} drifted from target — "
+                f"using best snapshot ({best_score:.3f})"
+            )
             final_dance = vae.decode(best_z)
             final_score = best_score
-    print(f"    Final Critic score: {final_score:.3f}")
 
-    return final_dance.cpu()
+    # Restore critic settings.
+    critic.temporal.dropout = old_temporal_dropout
+    for m in head_dropouts:
+        m.train()
+    print(f"    Final Critic score: {final_score:.3f}  (target distance={abs(final_score - effective_target):.3f})")
+
+    final_dance = final_dance.cpu()
+    if return_score:
+        return final_dance, float(final_score)
+    return final_dance
 
 
 @torch.no_grad()
@@ -1016,7 +1090,10 @@ def smooth_transitions(segments, overlap=10):
 def generate_full_dance(denoiser, vae, critic, schedule, dataset,
                         num_segments=NUM_SEGMENTS, audio=None,
                         audio_data_full=None, music_id=None,
-                        target=TARGET_REALISM, guidance_scale=GUIDANCE_SCALE):
+                        target=TARGET_REALISM, guidance_scale=GUIDANCE_SCALE,
+                        min_final_score=MIN_FINAL_CRITIC_SCORE,
+                        max_attempts=SEGMENT_MAX_ATTEMPTS,
+                        target_tolerance=TARGET_SCORE_TOLERANCE):
     """
     Generate a multi-segment dance by producing one latent code per segment,
     decoding each, and crossfading the results.
@@ -1030,14 +1107,39 @@ def generate_full_dance(denoiser, vae, critic, schedule, dataset,
         if audio is not None:
             seg_audio = audio  # same audio clip for all segments (short demo)
 
-        # Guided sampling → one normalised sequence (1, T, 51)
-        gen = guided_sample(
-            denoiser, vae, critic, schedule,
-            audio=seg_audio, num_samples=1, steps=DDIM_STEPS,
-            target=target, guidance_scale=guidance_scale,
-        )
-        # Denormalise
-        frames_3d = denormalize_sequence(gen[0].numpy(), dataset)  # (T, 17, 3)
+        # Best-of retries to get as close as possible to the requested target score.
+        best_gen = None
+        best_score = -1.0
+        best_dist = float("inf")
+        for attempt in range(max_attempts):
+            print(f"    Segment {seg_idx+1}/{num_segments} attempt {attempt+1}/{max_attempts}")
+            gen, score = guided_sample(
+                denoiser, vae, critic, schedule,
+                audio=seg_audio, num_samples=1, steps=DDIM_STEPS,
+                target=target, guidance_scale=guidance_scale,
+                return_score=True,
+            )
+            dist = abs(score - target)
+            if dist < best_dist:
+                best_dist = dist
+                best_score = score
+                best_gen = gen
+
+            if dist <= target_tolerance:
+                print(
+                    f"    Accepted segment score {score:.3f} "
+                    f"(distance {dist:.3f} <= tolerance {target_tolerance:.3f})"
+                )
+                break
+
+        if best_dist > target_tolerance:
+            print(
+                f"    Using closest available segment score {best_score:.3f} "
+                f"(distance {best_dist:.3f}) after {max_attempts} attempts"
+            )
+
+        # Denormalise best sampled segment.
+        frames_3d = denormalize_sequence(best_gen[0].numpy(), dataset)  # (T, 17, 3)
         segments.append(frames_3d)
 
     # Stitch segments with crossfade
