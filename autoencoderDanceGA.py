@@ -394,6 +394,41 @@ def smooth_frames(frames, window_size=5):
     return smoothed
 
 
+def compute_output_metrics(frames):
+    """
+    Compute interpretable quality metrics for a generated dance.
+
+    Returns:
+        smoothness_std_cm_per_frame: std of per-frame whole-body displacement
+        upright_ratio_pct: percent of frames where head is above hips
+        bone_length_std_cm: mean temporal std of key limb lengths
+    """
+    if len(frames) < 2:
+        return 0.0, 0.0, 0.0
+
+    # Smoothness: frame-to-frame displacement variability (cm/frame std)
+    velocities = np.linalg.norm(np.diff(frames, axis=0), axis=(1, 2))
+    smoothness_std_cm_per_frame = float(np.std(velocities))
+
+    # Upright ratio: % frames with head above hip center
+    head_y = frames[:, 0, 1]
+    hip_y = np.mean(frames[:, [11, 12], 1], axis=1)
+    upright_ratio_pct = float(np.mean(head_y > hip_y) * 100.0)
+
+    # Bone consistency: average temporal std across major limb lengths (cm std)
+    eval_bones = [
+        (5, 7), (7, 9), (6, 8), (8, 10),
+        (11, 13), (13, 15), (12, 14), (14, 16),
+    ]
+    bone_stds = []
+    for a, b in eval_bones:
+        bone_lengths = np.linalg.norm(frames[:, a] - frames[:, b], axis=1)
+        bone_stds.append(np.std(bone_lengths))
+    bone_length_std_cm = float(np.mean(bone_stds)) if bone_stds else 0.0
+
+    return smoothness_std_cm_per_frame, upright_ratio_pct, bone_length_std_cm
+
+
 def calculate_fitness(genome, model, dataset):
     """
     Evaluate fitness based on:
@@ -882,6 +917,13 @@ def main():
     
     # Get the final dance
     frames = decode_genome(best_genome, model, dataset)
+
+    # Print output metrics in interpretable units
+    smoothness_std, upright_ratio_pct, bone_length_std = compute_output_metrics(frames)
+    print("\nOutput quality metrics:")
+    print(f"Smoothness: {smoothness_std:.2f} cm/frame std")
+    print(f"Upright ratio: {upright_ratio_pct:.1f}%")
+    print(f"Bone length variance: {bone_length_std:.2f} cm std")
     
     # Visualize
     visualize_dance(frames, "VAE + GA Generated Dance")

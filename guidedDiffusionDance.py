@@ -111,7 +111,7 @@ DIFF_LR = 1e-4
 # --- Guided Sampling (Step 5) ---
 TARGET_REALISM = 1
 GUIDANCE_SCALE = 3.0
-DDIM_STEPS = 200
+DDIM_STEPS = 100
 MIN_FINAL_CRITIC_SCORE = 0.88      # Retry a segment if final score falls below this
 SEGMENT_MAX_ATTEMPTS = 3           # Max guided sampling retries per segment
 TARGET_SCORE_TOLERANCE = 0.03      # Accept segment when |score - target| is below this
