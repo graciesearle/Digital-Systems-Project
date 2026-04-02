@@ -1,16 +1,16 @@
 """
-Guided Latent Diffusion Dance Generator
+Guided Latent Diffusion Dance Generator - System 2
 ========================================
 Replaces the Genetic Algorithm from autoencoderDanceGA.py with a modern
 generative pipeline while keeping the proven VAE architecture.
 
 Pipeline:
-  Step 1 – Data Normalization & Preprocessing  (kept from autoencoderDanceGA.py)
-  Step 2 – Biomechanical VAE                   (kept from autoencoderDanceGA.py)
-  Step 3 – Adversarial Critic                  (NEW — replaces GA fitness)
-  Step 4 – Audio-Conditioned Latent Diffusion  (NEW — replaces GA search)
-  Step 5 – Classifier-Guided Sampling          (NEW — steers creativity)
-  Step 6 – Denormalization & Synthesis          (NEW — ffmpeg video + audio)
+  Step 1 - Data Normalisation & Preprocessing  (kept from autoencoderDanceGA.py)
+  Step 2 - Biomechanical VAE                   (kept from autoencoderDanceGA.py)
+  Step 3 - Learned Realism Critic                  (NEW — replaces GA fitness)
+  Step 4 - Audio-Conditioned Latent Diffusion  (NEW — replaces GA search)
+  Step 5 - Classifier-Guided Sampling          (NEW — steers creativity)
+  Step 6 - Denormalisation & Synthesis          (NEW — ffmpeg video + audio)
 
 Requires: torch, numpy, librosa, matplotlib, ffmpeg (system)
 """
@@ -94,7 +94,7 @@ VAE_LR = 0.001
 VAE_EPOCHS = 150
 KL_WARMUP_EPOCHS = 20
 
-# --- Adversarial Critic (Step 3) ---
+# --- Learned Realism Critic (Step 3) ---
 CRITIC_HIDDEN = 256
 CRITIC_EPOCHS = 100
 CRITIC_BATCH = 256
@@ -111,10 +111,12 @@ DIFF_LR = 1e-4
 # --- Guided Sampling (Step 5) ---
 TARGET_REALISM = 1
 GUIDANCE_SCALE = 3.0
-DDIM_STEPS = 100
+DDIM_STEPS = 200
 MIN_FINAL_CRITIC_SCORE = 0.88      # Retry a segment if final score falls below this
 SEGMENT_MAX_ATTEMPTS = 3           # Max guided sampling retries per segment
 TARGET_SCORE_TOLERANCE = 0.03      # Accept segment when |score - target| is below this
+NOVELTY_REF_MAX = 1000             # Number of real AIST++ segments used as novelty reference
+NOVELTY_WEIGHT = 1.0               # 1.0 => pure (critic * distance_term), lower = more realism-heavy
 
 # --- Output ---
 NUM_SEGMENTS = 4  # how many 1-second segments to generate for one dance
@@ -129,9 +131,9 @@ GENRE_NAMES = {
 
 
 # =============================================================================
-# STEP 1 — DATA NORMALIZATION & PREPROCESSING
+# STEP 1 — DATA NORMALISATION & PREPROCESSING
 # =============================================================================
-# Kept from autoencoderDanceGA.py: mean/std normalization per joint-coordinate.
+# Kept from autoencoderDanceGA.py: mean/std normalisation per joint-coordinate.
 # =============================================================================
 
 def load_pkl(filepath):
@@ -284,8 +286,10 @@ class DanceAudioDataset(Dataset):
         ----------
         sequences : np.ndarray (N, seq_len, 17, 3)
         audio     : np.ndarray (N, N_MELS+2, seq_len) or None
+        Global per-joint normalisation (across all sequences/timesteps) places
+        heterogeneous motions on a comparable scale before representation
+        learning, which empirically stabilises both VAE and diffusion training.
         """
-        # Compute normalisation stats over the whole dataset
         self.mean = sequences.mean(axis=(0, 1), keepdims=True)   # (1,1,17,3)
         self.std = sequences.std(axis=(0, 1), keepdims=True) + 1e-8
 
@@ -307,8 +311,8 @@ class DanceAudioDataset(Dataset):
     def __getitem__(self, idx):
         return self.dance[idx], self.audio[idx]
 
-    # --- Utility for denormalization (Step 6) ---
-    def denormalize(self, data):
+    # --- Utility for denormalisation (Step 6) ---
+    def denormalise(self, data):
         """Convert normalised flat data back to original-scale 3D coordinates."""
         if isinstance(data, torch.Tensor):
             data = data.cpu().numpy()
@@ -466,10 +470,10 @@ def train_vae(model, dataloader, epochs=VAE_EPOCHS, lr=VAE_LR,
 
 
 # =============================================================================
-# STEP 3 — ADVERSARIAL CRITIC  (replaces GA fitness scoring)
+# STEP 3 — LEARNED REALISM CRITIC  (replaces GA fitness scoring)
 # =============================================================================
 
-class AdversarialCritic(nn.Module):
+class LearnedRealismCritic(nn.Module):
     """
     Binary classifier grading realism of a *decoded* dance sequence.
 
@@ -479,6 +483,11 @@ class AdversarialCritic(nn.Module):
     Training:
         Real samples → label 1.0  (clean AIST++ sequences)
         Fake samples → label 0.0  (VAE-decoded random latent noise)
+
+    Note:
+        The critic is not used as a GAN discriminator for end-to-end
+        updates. Instead, it serves as a learned realism functional that guides
+        latent sampling at inference time.
     """
 
     def __init__(self, feature_dim=INPUT_DIM, hidden=CRITIC_HIDDEN):
@@ -519,7 +528,7 @@ def train_critic(critic, vae, dataloader, epochs=CRITIC_EPOCHS, lr=CRITIC_LR):
         This prevents the critic from saturating on trivially fake samples.
     """
     print(f"\n{'='*55}")
-    print(f"  [Step 3] Training Adversarial Critic  ({epochs} epochs)")
+    print(f"  [Step 3] Training Learned Realism Critic  ({epochs} epochs)")
     print(f"{'='*55}")
     critic.to(DEVICE)
     vae.to(DEVICE)
@@ -535,13 +544,16 @@ def train_critic(critic, vae, dataloader, epochs=CRITIC_EPOCHS, lr=CRITIC_LR):
         total = 0
 
         # Curriculum: start moderate, then increase fake difficulty.
+        # This avoids early training collapse caused by immediately presenting
+        # only near-real negatives.
         hardness = min(1.0, (epoch + 1) / max(int(epochs * 0.4), 1))
 
         for dance_b, _ in dataloader:
             B = dance_b.size(0)
             dance_b = dance_b.to(DEVICE)
 
-            # Mild augmentation keeps the critic from keying on tiny artefacts.
+            # Mild augmentation regularises the critic against overfitting to
+            # small numerical artefacts instead of motion structure.
             real_in = dance_b + 0.01 * torch.randn_like(dance_b)
 
             # --- Real (label-smoothed: 0.9 instead of 1.0) ---
@@ -589,7 +601,8 @@ def train_critic(critic, vae, dataloader, epochs=CRITIC_EPOCHS, lr=CRITIC_LR):
                     fake_dropout,
                 ], dim=0)
 
-                # Mine hardest negatives: choose fakes critic still thinks are real.
+                # Hard-negative mining approximates importance sampling over fake
+                # examples by selecting candidates with maximal predicted realism.
                 cand_scores = critic(candidate_fakes).squeeze(1)
                 hard_k = min(B, candidate_fakes.size(0))
                 hard_idx = torch.topk(cand_scores, k=hard_k, largest=True).indices
@@ -666,6 +679,8 @@ class DiffusionSchedule:
         """Forward diffusion: q(x_t | x_0)."""
         if noise is None:
             noise = torch.randn_like(x0)
+        # q(x_t | x_0) = sqrt(alpha_bar_t) * x_0 + sqrt(1-alpha_bar_t) * eps
+        # where eps ~ N(0, I)
         return (
             self._idx(self.sqrt_ab, t, x0.shape) * x0
             + self._idx(self.sqrt_1m_ab, t, x0.shape) * noise
@@ -849,6 +864,8 @@ def train_diffusion(denoiser, latent_dataset, schedule,
             z_t, noise = schedule.q_sample(z_batch, t)
 
             pred = denoiser(z_t, t, audio_batch)
+            # Standard epsilon-parameterisation objective:
+            #   min_theta E[||eps - eps_theta(z_t, t, c)||_2^2]
             loss = F.mse_loss(pred, noise)
 
             opt.zero_grad()
@@ -892,19 +909,15 @@ def guided_sample(denoiser, vae, critic, schedule, audio=None,
     print(f"    target={target:.0%}  base scale={guidance_scale}  steps={steps}")
     target = float(target)
 
-    # High targets (>=85%) get progressively safer hyper-parameters so extreme pushes stay stable.
+    # High realism targets (>=85%) are harder because critic probabilities are
+    # naturally compressed near 1.0; these heuristics reduce instability from
+    # over-aggressive gradients in late denoising steps.
     high_push = max(target - 0.85, 0.0) / 0.15  # 0 at 85%, 1 at 100%
     scale_factor = 1.0 - 0.4 * high_push        # trim up to 40% of the user scale near 100%
     safe_scale = max(0.1, guidance_scale * scale_factor)
     freeze_margin = max(0.02, 0.08 - 0.06 * high_push)  # freeze a tad before target when pushing hard
 
-    # Realistic cap: critic probabilities rarely reach 1.0, so hard 100% targets can
-    # keep pushing until late steps and destabilise.
-    effective_target = min(target, 0.93)
-
     print(f"    target-adapted scale={safe_scale:.2f}  freeze margin={freeze_margin:.3f}")
-    if effective_target < target:
-        print(f"    effective target capped to {effective_target:.0%} for stability")
     denoiser.eval()
     vae.eval()
     # Critic MUST stay in train mode — cuDNN RNN does not support backward in eval mode
@@ -928,7 +941,8 @@ def guided_sample(denoiser, vae, critic, schedule, audio=None,
     else:
         audio_in = audio.to(DEVICE)
 
-    # Only start guiding after 30% of steps (early z0 predictions bad)
+    # Guidance is delayed: early z0 estimates are noisy and gradients are less
+    # semantically meaningful before coarse denoising has occurred.
     guide_start = int(steps * 0.3)
 
     # Best-z tracking: keep the latent whose critic score is closest to target.
@@ -954,8 +968,10 @@ def guided_sample(denoiser, vae, critic, schedule, audio=None,
                 decoded = vae.decode(z0_g)          # (B, T, 51)
                 score = critic(decoded)              # (B, 1)
 
-                # Explicit target matching objective: minimize (score - target)^2.
-                target_loss = torch.mean((score - effective_target) ** 2)
+                # Target-matching objective used for classifier guidance:
+                #   L(z0) = (critic(decode(z0)) - target)^2
+                # Gradient descent on L steers realism up or down symmetrically.
+                target_loss = torch.mean((score - target) ** 2)
                 target_loss.backward()
             grad = z0_g.grad.detach()
 
@@ -969,8 +985,9 @@ def guided_sample(denoiser, vae, critic, schedule, audio=None,
             ramp = min(progress / 0.4, 1.0)
             adaptive_scale = safe_scale * ramp
 
-            # Taper guidance near the target to avoid oscillation/overshoot.
-            dist_to_target = abs(mean_score - effective_target)
+            # Taper guidance near the target to avoid oscillatory behaviour
+            # caused by finite-step updates in DDIM trajectories.
+            dist_to_target = abs(mean_score - target)
             taper = max(0.15, min(1.0, dist_to_target / max(2 * freeze_margin, 1e-6)))
             adaptive_scale *= taper
 
@@ -1004,7 +1021,7 @@ def guided_sample(denoiser, vae, critic, schedule, audio=None,
     with torch.no_grad():
         final_dance = vae.decode(z)          # (B, T, 51)
         final_score = critic(final_dance).mean().item()
-        final_dist = abs(final_score - effective_target)
+        final_dist = abs(final_score - target)
         drift_margin = 0.01
         if final_dist > best_dist + drift_margin:
             print(
@@ -1018,7 +1035,7 @@ def guided_sample(denoiser, vae, critic, schedule, audio=None,
     critic.temporal.dropout = old_temporal_dropout
     for m in head_dropouts:
         m.train()
-    print(f"    Final Critic score: {final_score:.3f}  (target distance={abs(final_score - effective_target):.3f})")
+    print(f"    Final Critic score: {final_score:.3f}  (target distance={abs(final_score - target):.3f})")
 
     final_dance = final_dance.cpu()
     if return_score:
@@ -1054,35 +1071,169 @@ def unguided_sample(denoiser, vae, schedule, audio=None,
 
 
 # =============================================================================
-# STEP 6 — DENORMALIZATION & SYNTHESIS
+# STEP 6 — DENORMALISATION & SYNTHESIS
 # =============================================================================
 
-def denormalize_sequence(seq_flat, dataset):
+def denormalise_sequence(seq_flat, dataset):
     """
-    Convert a normalised (T, 51) sequence back to (T, 17, 3) real-world coords.
+    Convert a normalised (T, 51) sequence back to (T, 17, 3) real-world coordinates.
     Uses the same mean/std from the dataset (Step 1).
     """
-    return dataset.denormalize(seq_flat)
+    return dataset.denormalise(seq_flat)
+
+
+def _pelvis_center_flat_sequence(seq_flat):
+    """Remove global translation from a (T, 51) sequence using hip-center root."""
+    seq = seq_flat.reshape(SEQUENCE_LENGTH, NUM_KEYPOINTS, NUM_COORDS)
+    root = 0.5 * (seq[:, 11, :] + seq[:, 12, :])
+    centered = seq - root[:, None, :]
+    return centered.reshape(SEQUENCE_LENGTH, INPUT_DIM)
+
+
+def build_novelty_reference(dataset, max_refs=NOVELTY_REF_MAX):
+    """
+    Build novelty reference vectors from real AIST++ sequences in dataset space.
+    Returns array of shape (N_ref, T*51) with pelvis-centering applied.
+    """
+    all_real = dataset.dance.cpu().numpy()  # (N, T, 51)
+    n = len(all_real)
+    if n == 0:
+        return np.zeros((0, SEQUENCE_LENGTH * INPUT_DIM), dtype=np.float32)
+
+    if n > max_refs:
+        idx = np.random.choice(n, size=max_refs, replace=False)
+        all_real = all_real[idx]
+
+    centered = np.array([_pelvis_center_flat_sequence(s) for s in all_real], dtype=np.float32)
+    return centered.reshape(len(centered), -1)
+
+
+def novelty_distance_to_aist(seq_flat, novelty_ref):
+    """
+    Nearest-neighbour distance to real AIST++ motion windows.
+    Higher means further from training motions (more novel).
+    """
+    if novelty_ref is None or len(novelty_ref) == 0:
+        return None
+    q = _pelvis_center_flat_sequence(seq_flat).reshape(1, -1).astype(np.float32)
+    d = np.mean((novelty_ref - q) ** 2, axis=1)
+    return float(np.min(d))
+
+
+def novelty_score(critic_score, novelty_dist, novelty_weight=NOVELTY_WEIGHT):
+    """
+    Combined novelty objective that rewards both realism and distance from AIST++:
+        novelty = critic_score * ((1-w) + w * novelty_dist/(1+novelty_dist))
+    """
+    if critic_score is None or novelty_dist is None:
+        return None
+    w = float(np.clip(novelty_weight, 0.0, 1.0))
+    dist_term = novelty_dist / (1.0 + novelty_dist)
+    return float(critic_score * ((1.0 - w) + w * dist_term))
 
 
 def smooth_transitions(segments, overlap=10):
     """
-    Crossfade overlapping frames between consecutive segments to avoid jumps.
+    Crossfade overlapping frames between consecutive segments to reduce
+    perceptual boundary discontinuities at segment joins.
     segments: list of (T, 17, 3) arrays.
     """
+    def _smoothstep(x):
+        """Cubic easing for a softer transition than linear interpolation."""
+        return x * x * (3.0 - 2.0 * x)
+
+    def _align_segment_to_previous(prev_seg, next_seg):
+        """
+        Align next segment to previous one in global space before blending.
+        Uses pelvis translation + yaw alignment from hip orientation.
+        """
+        aligned = np.copy(next_seg)
+
+        prev_end = prev_seg[-1]
+        next_start = aligned[0]
+
+        # Pelvis root from left/right hips.
+        prev_root = 0.5 * (prev_end[11] + prev_end[12])
+        next_root = 0.5 * (next_start[11] + next_start[12])
+
+        prev_hips = prev_end[12] - prev_end[11]
+        next_hips = next_start[12] - next_start[11]
+        prev_heading = np.array([prev_hips[0], prev_hips[2]], dtype=np.float32)
+        next_heading = np.array([next_hips[0], next_hips[2]], dtype=np.float32)
+
+        # Rotate around vertical axis so segment heading is consistent at the seam.
+        if np.linalg.norm(prev_heading) > 1e-6 and np.linalg.norm(next_heading) > 1e-6:
+            a_prev = np.arctan2(prev_heading[1], prev_heading[0])
+            a_next = np.arctan2(next_heading[1], next_heading[0])
+            theta = a_prev - a_next
+            c, s = np.cos(theta), np.sin(theta)
+
+            x = aligned[:, :, 0] - next_root[0]
+            z = aligned[:, :, 2] - next_root[2]
+            aligned[:, :, 0] = c * x - s * z + next_root[0]
+            aligned[:, :, 2] = s * x + c * z + next_root[2]
+
+        # Translate so roots coincide at the seam.
+        aligned_root = 0.5 * (aligned[0, 11] + aligned[0, 12])
+        delta = prev_root - aligned_root
+        aligned = aligned + delta[None, None, :]
+        return aligned
+
+    def _mean_bone_length(frame):
+        """Average skeleton bone length for one frame (17, 3)."""
+        lengths = []
+        for a, b in BONES:
+            lengths.append(np.linalg.norm(frame[a] - frame[b]))
+        return float(np.mean(lengths)) if lengths else 0.0
+
+    def _repair_collapsed_frames(blended, prev_tail, next_head):
+        """
+        Replace imploded overlap frames that can occur from direct pose blending.
+        Criterion: frame mean bone length falls far below local seam reference.
+        """
+        repaired = np.copy(blended)
+
+        seam_refs = []
+        for f in prev_tail:
+            seam_refs.append(_mean_bone_length(f))
+        for f in next_head:
+            seam_refs.append(_mean_bone_length(f))
+        ref = float(np.median(seam_refs)) if seam_refs else 0.0
+        if ref <= 1e-8:
+            return repaired
+
+        min_ratio = 0.6
+        for j in range(len(repaired)):
+            bl = _mean_bone_length(repaired[j])
+            if not np.isfinite(bl) or bl < min_ratio * ref:
+                alpha = j / max(len(repaired) - 1, 1)
+                repaired[j] = prev_tail[j] if alpha < 0.5 else next_head[j]
+
+        return repaired
+
     if len(segments) <= 1:
         return np.concatenate(segments, axis=0) if segments else np.array([])
 
+    overlap = max(1, int(overlap))
     result = [segments[0]]
     for seg in segments[1:]:
         prev = result[-1]
-        blended = np.copy(prev[-overlap:])
-        for j in range(overlap):
-            alpha = j / overlap
-            blended[j] = (1 - alpha) * prev[-overlap + j] + alpha * seg[j]
-        result[-1] = prev[:-overlap]
+        ov = min(overlap, len(prev), len(seg))
+        seg_aligned = _align_segment_to_previous(prev, seg)
+        prev_tail = prev[-ov:]
+        next_head = seg_aligned[:ov]
+
+        blended = np.copy(prev_tail)
+        for j in range(ov):
+            # Eased interpolation helps reduce visible velocity kinks.
+            alpha = _smoothstep(j / max(ov - 1, 1))
+            blended[j] = (1.0 - alpha) * prev_tail[j] + alpha * next_head[j]
+
+        blended = _repair_collapsed_frames(blended, prev_tail, next_head)
+
+        result[-1] = prev[:-ov]
         result.append(blended)
-        result.append(seg[overlap:])
+        result.append(seg_aligned[ov:])
 
     return np.concatenate(result, axis=0)
 
@@ -1091,6 +1242,7 @@ def generate_full_dance(denoiser, vae, critic, schedule, dataset,
                         num_segments=NUM_SEGMENTS, audio=None,
                         audio_data_full=None, music_id=None,
                         target=TARGET_REALISM, guidance_scale=GUIDANCE_SCALE,
+                        novelty_ref=None, novelty_weight=NOVELTY_WEIGHT,
                         min_final_score=MIN_FINAL_CRITIC_SCORE,
                         max_attempts=SEGMENT_MAX_ATTEMPTS,
                         target_tolerance=TARGET_SCORE_TOLERANCE):
@@ -1111,6 +1263,9 @@ def generate_full_dance(denoiser, vae, critic, schedule, dataset,
         best_gen = None
         best_score = -1.0
         best_dist = float("inf")
+        best_nov_dist = None
+        best_nov_score = None
+        best_rank = -float("inf")
         for attempt in range(max_attempts):
             print(f"    Segment {seg_idx+1}/{num_segments} attempt {attempt+1}/{max_attempts}")
             gen, score = guided_sample(
@@ -1120,26 +1275,42 @@ def generate_full_dance(denoiser, vae, critic, schedule, dataset,
                 return_score=True,
             )
             dist = abs(score - target)
-            if dist < best_dist:
+            nov_dist = novelty_distance_to_aist(gen[0].numpy(), novelty_ref)
+            nov_score = novelty_score(score, nov_dist, novelty_weight)
+
+            if nov_score is not None:
+                realism_gate = 1.0 if score >= min_final_score else 0.5
+                rank = realism_gate * nov_score
+                print(
+                    f"      critic={score:.3f}  target_dist={dist:.3f}  "
+                    f"nov_dist={nov_dist:.6f}  novelty={nov_score:.6f}"
+                )
+            else:
+                # Fallback to the original target-tracking criterion.
+                rank = -dist
+                print(f"      critic={score:.3f}  target_dist={dist:.3f}")
+
+            if rank > best_rank:
+                best_rank = rank
                 best_dist = dist
                 best_score = score
+                best_nov_dist = nov_dist
+                best_nov_score = nov_score
                 best_gen = gen
 
-            if dist <= target_tolerance:
-                print(
-                    f"    Accepted segment score {score:.3f} "
-                    f"(distance {dist:.3f} <= tolerance {target_tolerance:.3f})"
-                )
-                break
-
-        if best_dist > target_tolerance:
+        if best_nov_score is not None:
+            print(
+                f"    Selected segment: critic={best_score:.3f}  target_dist={best_dist:.3f}  "
+                f"nov_dist={best_nov_dist:.6f}  novelty={best_nov_score:.6f}"
+            )
+        elif best_dist > target_tolerance:
             print(
                 f"    Using closest available segment score {best_score:.3f} "
                 f"(distance {best_dist:.3f}) after {max_attempts} attempts"
             )
 
         # Denormalise best sampled segment.
-        frames_3d = denormalize_sequence(best_gen[0].numpy(), dataset)  # (T, 17, 3)
+        frames_3d = denormalise_sequence(best_gen[0].numpy(), dataset)  # (T, 17, 3)
         segments.append(frames_3d)
 
     # Stitch segments with crossfade
@@ -1293,7 +1464,7 @@ def main():
     # Step 1: Load & Preprocess
     # ==================================================================
     print(f"\n{'='*55}")
-    print("  [Step 1] Data Normalization & Preprocessing")
+    print("  [Step 1] Data Normalisation & Preprocessing")
     print(f"{'='*55}")
 
     raw_dance, audio_data, music_ids = load_paired_data(
@@ -1305,9 +1476,11 @@ def main():
         return
 
     dataset = DanceAudioDataset(raw_dance, audio_data)
+    novelty_ref = build_novelty_reference(dataset, max_refs=NOVELTY_REF_MAX)
     dataloader = DataLoader(dataset, batch_size=VAE_BATCH, shuffle=True, drop_last=True)
     print(f"  Dataset size : {len(dataset)} segments")
     print(f"  Data shape   : {raw_dance.shape}")
+    print(f"  Novelty refs : {len(novelty_ref)}")
 
     # ==================================================================
     # Step 2: Train / Load Biomechanical VAE
@@ -1342,9 +1515,9 @@ def main():
         _plot_vae_history(hist)
 
     # ==================================================================
-    # Step 3: Train / Load Adversarial Critic
+    # Step 3: Train / Load Learned Realism Critic
     # ==================================================================
-    critic = AdversarialCritic()
+    critic = LearnedRealismCritic()
     critic_path = "guided_critic.pth"
 
     if os.path.exists(critic_path):
@@ -1402,6 +1575,8 @@ def main():
         audio=sample_audio,
         target=TARGET_REALISM,
         guidance_scale=GUIDANCE_SCALE,
+        novelty_ref=novelty_ref,
+        novelty_weight=NOVELTY_WEIGHT,
     )
 
     # Visualise

@@ -1,5 +1,5 @@
 """
-Autoencoder-based Dance Generator with Genetic Algorithm Evaluation
+Autoencoder-based Dance Generator with Genetic Algorithm Evaluation - System 1
 1. Train an autoencoder to learn latent representations of AIST++ dances
 2. Use GA to evolve latent vectors that produce novel, high-quality dances
 """
