@@ -40,7 +40,7 @@ KL_WARMUP_EPOCHS = 20  # Epochs before KL reaches full weight
 # GA Parameters
 POPULATION_SIZE = 50
 NUM_GENERATIONS = 100
-MUTATION_RATE = 0.15
+MUTATION_RATE = 0.20
 MUTATION_STRENGTH = 0.1  # Reduced - too high causes jerky/broken poses
 CROSSOVER_RATE = 0.7
 TOURNAMENT_SIZE = 5

@@ -483,11 +483,6 @@ class LearnedRealismCritic(nn.Module):
     Training:
         Real samples → label 1.0  (clean AIST++ sequences)
         Fake samples → label 0.0  (VAE-decoded random latent noise)
-
-    Note:
-        The critic is not used as a GAN discriminator for end-to-end
-        updates. Instead, it serves as a learned realism functional that guides
-        latent sampling at inference time.
     """
 
     def __init__(self, feature_dim=INPUT_DIM, hidden=CRITIC_HIDDEN):
@@ -522,7 +517,7 @@ def train_critic(critic, vae, dataloader, epochs=CRITIC_EPOCHS, lr=CRITIC_LR):
         --------
         1) Build a large pool of heterogeneous fakes per batch (easy + near-real).
         2) Score the pool with the current critic.
-        3) Keep only the hardest negatives (highest "real" scores).
+        3) Keep only the hardest negatives.
         4) Train on clean real data versus mined hard fakes.
 
         This prevents the critic from saturating on trivially fake samples.
@@ -544,16 +539,14 @@ def train_critic(critic, vae, dataloader, epochs=CRITIC_EPOCHS, lr=CRITIC_LR):
         total = 0
 
         # Curriculum: start moderate, then increase fake difficulty.
-        # This avoids early training collapse caused by immediately presenting
-        # only near-real negatives.
+        # This avoids early training collapse caused by immediately presenting only near-real negatives.
         hardness = min(1.0, (epoch + 1) / max(int(epochs * 0.4), 1))
 
         for dance_b, _ in dataloader:
             B = dance_b.size(0)
             dance_b = dance_b.to(DEVICE)
 
-            # Mild augmentation regularises the critic against overfitting to
-            # small numerical artefacts instead of motion structure.
+            # Mild augmentation regularises the critic against overfitting to small numerical artefacts instead of motion structure.
             real_in = dance_b + 0.01 * torch.randn_like(dance_b)
 
             # --- Real (label-smoothed: 0.9 instead of 1.0) ---
@@ -601,8 +594,7 @@ def train_critic(critic, vae, dataloader, epochs=CRITIC_EPOCHS, lr=CRITIC_LR):
                     fake_dropout,
                 ], dim=0)
 
-                # Hard-negative mining approximates importance sampling over fake
-                # examples by selecting candidates with maximal predicted realism.
+                # Hard-negative mining approximates importance sampling over fake examples by selecting candidates with maximal predicted realism.
                 cand_scores = critic(candidate_fakes).squeeze(1)
                 hard_k = min(B, candidate_fakes.size(0))
                 hard_idx = torch.topk(cand_scores, k=hard_k, largest=True).indices
@@ -691,8 +683,7 @@ class DiffusionSchedule:
 
 class AudioEncoder(nn.Module):
     """
-    CNN + GRU encoder that compresses audio features into a fixed-size
-    conditioning vector suitable for the latent denoiser.
+    CNN + GRU encoder that compresses audio features into a fixed-size conditioning vector suitable for the latent denoiser.
     """
 
     def __init__(self, in_ch=N_MELS + 2, embed=AUDIO_EMBED_DIM):
@@ -760,8 +751,7 @@ class ResMLPBlock(nn.Module):
 
 class LatentDenoiser(nn.Module):
     """
-    Predicts noise ε given a noisy latent code z_t, timestep t,
-    and (optional) audio conditioning.
+    Predicts noise ε given a noisy latent code z_t, timestep t, and (optional) audio conditioning.
 
     Operates entirely in the VAE's latent space (R^{LATENT_DIM}).
     Temporal structure is delegated to the VAE decoder.
@@ -909,9 +899,7 @@ def guided_sample(denoiser, vae, critic, schedule, audio=None,
     print(f"    target={target:.0%}  base scale={guidance_scale}  steps={steps}")
     target = float(target)
 
-    # High realism targets (>=85%) are harder because critic probabilities are
-    # naturally compressed near 1.0; these heuristics reduce instability from
-    # over-aggressive gradients in late denoising steps.
+    # High realism targets (>=85%) are harder because critic probabilities are naturally compressed near 1.0; these heuristics reduce instability from over-aggressive gradients in late denoising steps.
     high_push = max(target - 0.85, 0.0) / 0.15  # 0 at 85%, 1 at 100%
     scale_factor = 1.0 - 0.4 * high_push        # trim up to 40% of the user scale near 100%
     safe_scale = max(0.1, guidance_scale * scale_factor)
@@ -941,8 +929,7 @@ def guided_sample(denoiser, vae, critic, schedule, audio=None,
     else:
         audio_in = audio.to(DEVICE)
 
-    # Guidance is delayed: early z0 estimates are noisy and gradients are less
-    # semantically meaningful before coarse denoising has occurred.
+    # Guidance is delayed: early z0 estimates are noisy and gradients are less semantically meaningful before coarse denoising has occurred.
     guide_start = int(steps * 0.3)
 
     # Best-z tracking: keep the latent whose critic score is closest to target.
@@ -985,8 +972,7 @@ def guided_sample(denoiser, vae, critic, schedule, audio=None,
             ramp = min(progress / 0.4, 1.0)
             adaptive_scale = safe_scale * ramp
 
-            # Taper guidance near the target to avoid oscillatory behaviour
-            # caused by finite-step updates in DDIM trajectories.
+            # Taper guidance near the target to avoid oscillatory behaviour caused by finite-step updates in DDIM trajectories.
             dist_to_target = abs(mean_score - target)
             taper = max(0.15, min(1.0, dist_to_target / max(2 * freeze_margin, 1e-6)))
             adaptive_scale *= taper
@@ -1337,7 +1323,7 @@ def get_bone_color(bone_idx):
         return BONE_COLORS["left_leg"]
 
 
-def visualize_dance(frames, title="Generated Dance", fps=60):
+def visualise_dance(frames, title="Generated Dance", fps=60):
     """3D skeleton animation of (T, 17, 3) dance data."""
     print(f"\n  Visualising dance ({len(frames)} frames @ {fps} FPS)...")
     T_len = len(frames)
@@ -1580,7 +1566,7 @@ def main():
     )
 
     # Visualise
-    visualize_dance(full_dance, title="Guided Diffusion Dance")
+    visualise_dance(full_dance, title="Guided Diffusion Dance")
 
     # Ask to save
     save = input("\nSave animation? (y/n): ").strip().lower()
