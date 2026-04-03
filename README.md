@@ -1,4 +1,4 @@
-# Digital Systems Project
+# Balancing Novelty and Control in Generative Dance Models
 Comparative study of dance generation using latent representation learning, evolutionary search, and guided diffusion.
 
 ## Project Summary
