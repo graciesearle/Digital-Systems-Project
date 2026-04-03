@@ -39,7 +39,6 @@ Default paths are configured in Digital Systems Project/guidedDiffusionDance.py 
 ## Running the Systems
 
 ### System 1: VAE plus Genetic Algorithm
-From the Digital Systems Project directory:
 python autoencoderDanceGA.py
 
 ### System 2: Guided Latent Diffusion
